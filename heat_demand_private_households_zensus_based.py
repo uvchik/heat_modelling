@@ -20,9 +20,17 @@ Vor 1919;Unter 30;3 - 6 Wohnungen;192;119;221;50;98;(48);(111);(50);(69);41;(103
 
 """
 import pandas as pd
+import numpy as np
+import seaborn
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.style.use('ggplot')
+#matplotlib.style.use('ggplot')
+#from oemof.db import config as cfg
+from sqlalchemy import create_engine
+engine = create_engine("postgresql+psycopg2://openmodsh_admin:op3nmod!sh@localhost:5434/openmodsh")
+#metadata = MetaData(schema=cfg.get('openMod.sh R/W', 'schema'), bind=engine)
+
+
 
 
 # read csv file (skip unwanted rows at the beginning of the file...)
@@ -30,6 +38,8 @@ df = pd.read_csv("./heat_data/apartments_sh.csv", sep=";", encoding="ISO-8859-1"
                  skiprows=5)
 #%%
 ####################### renaming columns ######################################
+
+
 
 # names of all value columns for schleswig holstein (columnames 4 - last column)
 rename_dict = {'010010000000 Flensburg, Stadt (Kreisfreie Stadt)': 'FL',
@@ -49,6 +59,8 @@ rename_dict = {'010010000000 Flensburg, Stadt (Kreisfreie Stadt)': 'FL',
                '01062 Stormarn (Kreis)':'OD',
                '02 Hamburg (Bundesland)':'HH',
                '01 Schleswig-Holstein (Bundesland)':'SH'}
+# map region keys to short name (e.g. 01000: FL)
+region_keys = {k.split(' ')[0][0:5]:v for k,v in rename_dict.items()}
 
 # index columns (check column order in csv file for correct naming)
 index = {"Unnamed: 0":"age",
@@ -126,6 +138,8 @@ for col in df:
     df[col] = df[col].str.replace(')','')
     df[col] = df[col].astype(int)
 
+
+
 # df is now a dataframe with two index columns age, size_of_apartments
 # and integer values in columns for number of the types of apartments
 #%%
@@ -138,8 +152,8 @@ ec = pd.read_csv('./heat_data/specific_heat_consumption_by_building_class_sh.csv
 ec.set_index(['age', "modernized", "Typ"], inplace=True)
 
 # create new dataframe based on index levels from ec
-multiindex = pd.MultiIndex.from_product([ec.index.levels[0],
-                                         ec.index.levels[2]],
+multiindex = pd.MultiIndex.from_product([ec.index.get_level_values('age').unique(),
+                                         ec.index.get_level_values('Typ').unique()],
                                          names=['age', 'typ'])
 average_energy = pd.DataFrame(index= multiindex, columns=['value'])
 
@@ -178,6 +192,7 @@ for a in df.index.get_level_values('age').unique():
                            average_energy.loc[(int(a), htype), 'value']
            # add housetype column to energy-dataframe
            energy.loc[(a,s,n), 'housetype'] = htype
+
 #%%
 ############  prepare for bdew equation    ####################################
 # determine the age structure of buildings
@@ -204,16 +219,32 @@ share_old_buildings['category'] = pd.cut(share_old_buildings[0],
                                          bins=intervals, labels=[8,7,6,5,4,3,2,1])
 
 #%%
-############## calculate timeseries based on bdew profiles ####################
+############## plot                         ###################################
 
-# TODO: replace with representative temperature timeseries for each region
-data = pd.read_csv("/home/simon/znes/projects/oemof/oemof_base/examples/development_examples/example_data.csv")
 
 # sum energy for every region grouped by housetype
 energy_per_region = energy.groupby('housetype').sum()
 
+total_demand = energy_per_region.sum().sum()/1e9
+plot = energy_per_region.stack().unstack('housetype')/1e6
+ax = plot.plot(kind="bar")
+ax.set_xlabel('Region')
+ax.set_ylabel('Annual heat demand in GW')
+ax.text(0, 1500, 'Total heat demand per year {0} in TWh'.format(
+                                                    np.round(total_demand, 1)),
+        style='italic',
+        bbox={'facecolor':'red', 'alpha':0.5, 'pad':10})
+
+####################  calculate timeseries based on bdew profiles #############
+#%%
+# TODO: replace with representative temperature timeseries for each region
+temperatures = pd.read_sql(('SELECT * FROM dev.dwd_temperature_data WHERE id=2429'),
+                            con=engine)
+
 # create a empty dataframe with one column per region
 temperature_data = pd.DataFrame(columns=energy.drop('housetype', axis=1).columns.copy())
+for col in temperature_data:
+    temperature_data[col] = temperatures.air_temperature
 # create a empty data frame for timeseries with one column per region
 energy_series = pd.DataFrame(columns=temperature_data.columns.copy())
 # import heat profile
@@ -227,12 +258,20 @@ for r in energy_per_region.columns:
         # create energy timeseries per region
        temp_energyseries[h] = heat_profile.create_bdew_profile(
             datapath="/home/simon/znes/projects/oemof/oemof_base/oemof/demandlib/bdew_data",
-            year=2011, temperature=data["temperature"],
+            year=2011, temperature=temperature_data[r],
             # TODO: Replace 'EFH' with h (once bug is resolved in oemof bdew heatprofile)
-            annual_heat_demand=energy_per_region.loc[h, r], shlp_type='EFH',
+            annual_heat_demand=energy_per_region.loc[h, r], shlp_type=h,
             building_class=share_old_buildings['category'][r], wind_class=1)
     energy_series[r] = temp_energyseries.sum(axis=1)
+seaborn.set(style='ticks')
 
+f = plt.figure()
+plt.title('Annual heat demand by region', color='black')
+#energy_series.resample('12H', how='sum').plot(kind="area",
+#                                                   stacked=True,
+#                                                  colormap='Set1',  ax=f.gca())
+plt.legend(loc='center left', bbox_to_anchor=(1.0, 0.5))
+plt.show()
 #%%
 ############# some calculations based on generated data #######################
 print("Yearly Energy consumption of private households in GWh :",
@@ -256,3 +295,15 @@ ax.set_xlabel("Age")
 ax.legend(average_energy.index.get_level_values('typ').unique(), loc='best')
 #ax.set_xticks(df.index)
 #ax.set_xticklabels(names, rotation=45)
+
+#%%
+eperregion= pd.DataFrame(energy_per_region.sum()/1e6)
+rk_inverted = {v:k for k,v in region_keys.items()}
+for k,v in rk_inverted.items():
+    if k not in ['SH', 'HH']:
+        eperregion.loc[k, 'region_key'] = v
+eperregion.rename(columns={0:'demand'}, inplace=True)
+eperregion = eperregion.round({'demand':2})
+eperregion['region_key'] = eperregion['region_key'].astype('str')
+eperregion.to_csv('~/znes/projects/openmod.sh/data/heat_demand.csv')
+
